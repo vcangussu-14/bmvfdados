@@ -10,6 +10,10 @@ from brfinance.utils import extract_substring
 from brfinance.constants import ENET_URL
 
 
+from sys import platform as _platform
+from io import StringIO
+
+
 class GetSearchResponse():
     def __init__(self, response) -> None:
         self.response = response
@@ -61,29 +65,71 @@ class GetSearchResponse():
 
                 new = search_results_df['data_entrega'].str.split(
                     "</spanOrder>", n=-1, expand=True)
+                
+                # -------------------------------------------------------------
+                # ajuste de data inconsistente que vem da CVM
+                # -------------------------------------------------------------
+                
+                for i in range(len(new)):
+                    if new.iloc[i][1][-4:] == '3009':
+                        new.at[i, 1] = new.iloc[i][1][0:-4] + '2009'
+                    if new.iloc[i][1][-4:] == '3023':
+                        new.at[i, 1] = new.iloc[i][1][0:-4] + '2023'
+
+                
                 search_results_df['data_entrega'] = pd.to_datetime(
                     new[1].str.strip(), format="%d/%m/%Y %H:%M")
 
                 new = search_results_df['ref_date'].str.split(
                     "</spanOrder>", n=-1, expand=True)
+                
+                
+                # -------------------------------------------------------------
+                # ajuste de data inconsistente que vem da CVM
+                # -------------------------------------------------------------
+                
+                for i in range(len(new)):
+                    if new.iloc[i][0][:4] == '3009':
+                        new.at[i, 0] = '2009' + new.iloc[i][0][4:] 
+                    if new.iloc[i][0][:4] == '2922':
+                        new.at[i, 0] = '2022' + new.iloc[i][0][4:] 
+                    if new.iloc[i][0][:4] == '3023':
+                        new.at[i, 0] = '2023' + new.iloc[i][0][4:] 
+
+                
+                # -----------------------------------------------------------------
+                #  correção erro *** pandas._libs.tslibs.np_datetime.OutOfBoundsDatetime: Out of bounds nanosecond timestamp: 29240930
+                # -----------------------------------------------------------------
+                
+                # Forçando datas inválidas para NaT
                 search_results_df['ref_date'] = pd.to_datetime(
-                    new[0].str.strip(), format="%Y%m%d")
+                    new[0].str.strip(), format="%Y%m%d", errors='coerce'
+                )
 
                 search_results_df['cod_cvm'] = search_results_df['cod_cvm'].str.replace(
                     r'\D+', '', regex=True)
 
-                search_results_df = search_results_df.replace(
-                    {'</spanOrder>': ''}, regex=True).sort_values('data_entrega', ascending=False)
+                # -----------------------------------------------------------------
+                #  correção erro *** ValueError: cannot call `vectorize` on size 0 inputs unless `otypes` is set
+                # -----------------------------------------------------------------
+                            
+                if _platform != "darwin":
+                    search_results_df = search_results_df.replace(
+                        {'</spanOrder>': ''}, regex=True).sort_values('data_entrega', ascending=False)
+                else:
+                    # Preenche NaNs com strings vazias e então faz o replace
+                    search_results_df = search_results_df.fillna('').replace({'</spanOrder>': ''}, regex=True)
+                    search_results_df = search_results_df.sort_values('data_entrega', ascending=False)
 
-                response_df = response_df.append(search_results_df)
+                # response_df = response_df.append(search_results_df)
+                response_df = pd.concat([response_df, search_results_df])
 
         return response_df
 
 
 class GetReportResponse():
-    def __init__(self, response, previous_results) -> None:
+    def __init__(self, response) -> None:
         self.response = response
-        self.previous_results = previous_results
 
     def data(self):
         data = {}
@@ -108,30 +154,68 @@ class GetReportResponse():
         table_index = 0
         if statement == "Demonstração das Mutações do Patrimônio Líquido":
             table_index = 1
+            
+        # ---------------------------------------------------------------------
+        #  ajuste erro em MacOS
+        # ---------------------------------------------------------------------            
+            
+        if _platform != "darwin":
+            df = pd.read_html(html, header=0, decimal=',')[table_index]
+        else:
+            df = pd.read_html(StringIO(html), header=0, decimal=',')[table_index]
 
-        df = pd.read_html(html, header=0, decimal=',')[table_index]
         converters = {c: lambda x: str(x) for c in df.columns}
-        df = pd.read_html(html, header=0, decimal=',',
-                          converters=converters)[table_index]
+
+        if _platform != "darwin":
+            df = pd.read_html(html, header=0, decimal=',',
+                              converters=converters)[table_index]
+        else:
+            df = pd.read_html(StringIO(html), header=0, decimal=',',
+                              converters=converters)[table_index]
+
 
         for ind, column in enumerate(df.columns):
             if column.strip() != "Conta" and column.strip() != "Descrição":
-                df[column] = df[column].astype(
-                    str).str.strip().str.replace(".", "", regex=True)
+                
+                # ---------------------------------------------------------------------
+                #  correção bug que estava zerando todos os campos da coluna de valor
+                # ---------------------------------------------------------------------      
+                
+                # Substitui os valores NaN por uma string vazia para evitar problemas na conversão
+                df[column] = df[column].fillna("")
+                
+                # Remove espaços em branco e converte para string, removendo pontos dos números
+                df[column] = df[column].astype(str).str.strip().str.replace(r"\.", "", regex=True)
+                
+                # Converte a coluna para valores numéricos; valores não numéricos e vazios se tornarão NaN
                 df[column] = pd.to_numeric(df[column], errors='coerce')
+                
             else:
                 df[column] = df[column].astype(str).str.strip().astype(str)
 
+        # Get first column (most recent data available)
         if statement != "Demonstração das Mutações do Patrimônio Líquido":
-            if not self.previous_results:
-                # Get first column (most recent data available)
-                df = df.iloc[:, 0:3]
-                df.set_axis([*df.columns[:-1], 'Valor'], axis=1, inplace=True)
+            df = df.iloc[:, 0:3]
+            
+            # -----------------------------------------------------------------
+            #  Correção warning
+            #
+            #  FutureWarning: DataFrame.set_axis 'inplace' keyword is deprecated and will be removed in a future version. Use `obj = obj.set_axis(..., copy=False)` instead
+            #  df.set_axis([*df.columns[:-1], 'Valor'], axis=1, inplace=True)
+            # -----------------------------------------------------------------
+
+            df = df.set_axis([*df.columns[:-1], 'Valor'], axis=1, copy=False)
+            
 
         # df["refDate"] = reference_date
         #df["refDate"] = pd.to_datetime(df["refDate"], errors="coerce")
         # df["document_version"] = document_version
         df["currency_unit"] = currency_unit
+        
+        # captura tipo de report
+        tipo_report = soup.find(id='TituloTabelaSemBorda').getText()
+        tipo_report = tipo_report.split(" - ")[index_moeda-1].replace("(", "").replace(")", "")
+        df["tipo_report"] = tipo_report
 
         return df
 
